@@ -11,3 +11,7 @@ const countriesContainer = document.querySelector(".countries");
 
 ///////////////////////////////////////
 
+const request = new XMLHttpRequest();
+
+// console.log(request);
+request.open("GET", "https://restcountries.com/v2/name/portugal");
