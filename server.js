@@ -113,7 +113,10 @@ const LOCAL_ORIGIN_PATTERN = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/;
  */
 function getCorsHeaders(request) {
   const origin = request.headers.origin;
-  if (origin && (ALLOWED_ORIGINS.has(origin) || LOCAL_ORIGIN_PATTERN.test(origin))) {
+  if (
+    origin &&
+    (ALLOWED_ORIGINS.has(origin) || LOCAL_ORIGIN_PATTERN.test(origin))
+  ) {
     return { "Access-Control-Allow-Origin": origin, Vary: "Origin" };
   }
   return {};
