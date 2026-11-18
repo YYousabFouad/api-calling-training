@@ -7,6 +7,7 @@ const { resolve } = require("node:path");
 const HOST = "127.0.0.1";
 const DEFAULT_PORT = 3000;
 const MAX_QUERY_LENGTH = 100;
+const VALID_ALPHA3_CODE = /^[A-Z]{3}$/;
 const MAX_UPSTREAM_BYTES = 10_485_760;
 const REQUEST_TIMEOUT_MS = 20_000;
 const SERVER_REQUEST_TIMEOUT_MS = 15_000;
@@ -211,6 +212,39 @@ async function readBoundedResponseText(upstreamResponse, maxBytes) {
 }
 
 /**
+ * Builds and validates the upstream REST Countries v5 URL from `code` or `q`.
+ * @param {URL} requestUrl The incoming parsed request URL.
+ * @returns {{ ok: true, url: URL } | { ok: false, error: string }} Validated URL or error message.
+ */
+function buildUpstreamUrl(requestUrl) {
+  const hasCode = requestUrl.searchParams.has("code");
+  const hasQuery = requestUrl.searchParams.has("q");
+
+  if (hasCode && hasQuery) {
+    return { ok: false, error: "Provide either code or q, not both" };
+  }
+
+  if (hasCode) {
+    const code = requestUrl.searchParams.get("code")?.trim().toUpperCase();
+    if (!code || !VALID_ALPHA3_CODE.test(code)) {
+      return { ok: false, error: "A valid 3-letter code parameter is required" };
+    }
+    return { ok: true, url: new URL(`${API_URL}/codes.alpha_3/${code}`) };
+  }
+
+  const upstreamUrl = new URL(API_URL);
+  if (hasQuery) {
+    const query = requestUrl.searchParams.get("q")?.trim();
+    if (!query || query.length > MAX_QUERY_LENGTH) {
+      return { ok: false, error: "A valid q query parameter is required" };
+    }
+    upstreamUrl.searchParams.set("q", query);
+  }
+
+  return { ok: true, url: upstreamUrl };
+}
+
+/**
  * Proxies the country search without exposing the API key to the browser.
  * @param {import("node:http").IncomingMessage} request The incoming request.
  * @param {import("node:http").ServerResponse} response The outgoing response.
@@ -253,13 +287,12 @@ async function handleCountrySearch(request, response, requestUrl) {
     );
   }
 
-  const hasQuery = requestUrl.searchParams.has("q");
-  const query = requestUrl.searchParams.get("q")?.trim();
-  if (hasQuery && (!query || query.length > MAX_QUERY_LENGTH)) {
+  const upstreamTarget = buildUpstreamUrl(requestUrl);
+  if (!upstreamTarget.ok) {
     return sendJson(
       response,
       400,
-      { error: "A valid q query parameter is required" },
+      { error: upstreamTarget.error },
       corsHeaders,
     );
   }
@@ -277,10 +310,7 @@ async function handleCountrySearch(request, response, requestUrl) {
     );
   }
 
-  const upstreamUrl = new URL(API_URL);
-  if (query) {
-    upstreamUrl.searchParams.set("q", query);
-  }
+  const upstreamUrl = upstreamTarget.url;
 
   try {
     const upstreamResponse = await fetch(upstreamUrl, {

@@ -9,7 +9,7 @@ const countriesContainer = document.querySelector(".countries");
 ///////////////////////////////////////
 
 const COUNTRIES_API_URL = "http://127.0.0.1:3000/api/countries";
-const TARGET_COUNTRIES = ["egypt", "portugal", "argentina"];
+const TARGET_COUNTRIES = ["portugal", "argentina"];
 const ONE_MILLION = 1_000_000;
 const HTML_ENTITIES = {
   "&": "&amp;",
@@ -98,11 +98,14 @@ function toCountryViewModel(country) {
 /**
  * Builds the `<article class="country">` HTML markup from a view model.
  * @param {{ name: string, region: string, flagUrl: string, flagAlt: string, population: string, language: string, currency: string }} viewModel Escaped-ready card data.
+ * @param {string} [className] Optional extra CSS modifier class (e.g., "neighbour").
  * @returns {string} HTML string matching the index.html card template.
  */
-function createCountryCardHtml(viewModel) {
+function createCountryCardHtml(viewModel, className = "") {
+  const cardClass = className ? `country ${escapeHtml(className)}` : "country";
+
   return `
-    <article class="country">
+    <article class="${cardClass}">
       <img class="country__img" src="${escapeHtml(viewModel.flagUrl)}" alt="${escapeHtml(viewModel.flagAlt)}" />
       <div class="country__data">
         <h3 class="country__name">${escapeHtml(viewModel.name)}</h3>
@@ -136,6 +139,16 @@ function selectCountry(responsePayload, countryName) {
 }
 
 /**
+ * Returns the first bordering ISO alpha-3 code for a country, if present.
+ * @param {Record<string, any> | null} country Raw country object from the API.
+ * @returns {string | null} First border code or null when none exist.
+ */
+function getFirstNeighbourCode(country) {
+  const borders = country?.borders;
+  return Array.isArray(borders) && borders.length > 0 ? borders[0] : null;
+}
+
+/**
  * Checks whether an HTTP status code indicates a successful 2xx response.
  * @param {number} status HTTP response status code.
  * @returns {boolean} True when status is in the 200-299 range.
@@ -147,15 +160,18 @@ function isSuccessStatus(status) {
 /**
  * Renders a country card into the target DOM container.
  * @param {Record<string, any> | null} country Country record to render.
- * @param {Element | null} [container] Target DOM container.
+ * @param {{ className?: string, container?: Element | null }} [options] Rendering options.
  * @returns {void} Nothing.
  */
-function renderCountryCard(country, container = countriesContainer) {
+function renderCountryCard(
+  country,
+  { className = "", container = countriesContainer } = {},
+) {
   if (!container || !country) {
     return;
   }
 
-  const html = createCountryCardHtml(toCountryViewModel(country));
+  const html = createCountryCardHtml(toCountryViewModel(country), className);
   container.insertAdjacentHTML("beforeend", html);
   container.style.opacity = "1";
 }
@@ -173,7 +189,9 @@ function fetchJson(url) {
     request.addEventListener("load", function () {
       if (!isSuccessStatus(this.status)) {
         reject(
-          new Error(`Request failed with status ${this.status}: ${this.responseText}`),
+          new Error(
+            `Request failed with status ${this.status}: ${this.responseText}`,
+          ),
         );
         return;
       }
@@ -194,7 +212,35 @@ function fetchJson(url) {
 }
 
 /**
- * Fetches and renders cards for the configured list of countries in order.
+ * Fetches a country and its first bordering neighbour country.
+ * @param {string} countryName Country name to search.
+ * @returns {Promise<{ country: Record<string, any> | null, neighbour: Record<string, any> | null }>} Country pair.
+ */
+async function fetchCountryWithNeighbour(countryName) {
+  const searchUrl = `${COUNTRIES_API_URL}?q=${encodeURIComponent(countryName)}`;
+  const payload = await fetchJson(searchUrl);
+  const country = selectCountry(payload, countryName);
+  const neighbourCode = getFirstNeighbourCode(country);
+
+  if (!neighbourCode) {
+    return { country, neighbour: null };
+  }
+
+  try {
+    const neighbourUrl = `${COUNTRIES_API_URL}?code=${encodeURIComponent(neighbourCode)}`;
+    const neighbourPayload = await fetchJson(neighbourUrl);
+    return {
+      country,
+      neighbour: neighbourPayload?.data?.objects?.[0] ?? null,
+    };
+  } catch (error) {
+    console.error(`Failed to load neighbour ${neighbourCode}:`, error);
+    return { country, neighbour: null };
+  }
+}
+
+/**
+ * Fetches and renders cards for each configured country and its neighbour in order.
  * @param {string[]} countryNames Country names to fetch and display.
  * @param {Element | null} [container] Target DOM container.
  * @returns {Promise<void>} Resolves after all country cards are processed.
@@ -206,18 +252,20 @@ async function renderCountries(countryNames, container = countriesContainer) {
 
   container.replaceChildren();
 
-  const requests = countryNames.map(async (countryName) => {
-    const url = `${COUNTRIES_API_URL}?q=${encodeURIComponent(countryName)}`;
-    const payload = await fetchJson(url);
-    return selectCountry(payload, countryName);
-  });
+  const results = await Promise.allSettled(
+    countryNames.map((countryName) => fetchCountryWithNeighbour(countryName)),
+  );
 
-  const results = await Promise.allSettled(requests);
   results.forEach((result) => {
-    if (result.status === "fulfilled") {
-      renderCountryCard(result.value, container);
-    } else {
+    if (result.status !== "fulfilled") {
       console.error(result.reason);
+      return;
+    }
+
+    const { country, neighbour } = result.value;
+    renderCountryCard(country, { container });
+    if (neighbour) {
+      renderCountryCard(neighbour, { className: "neighbour", container });
     }
   });
 }
