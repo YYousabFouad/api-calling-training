@@ -9,6 +9,7 @@ const countriesContainer = document.querySelector(".countries");
 ///////////////////////////////////////
 
 const COUNTRIES_API_URL = "http://127.0.0.1:3000/api/countries";
+const TARGET_COUNTRIES = ["egypt", "portugal", "argentina"];
 const ONE_MILLION = 1_000_000;
 const HTML_ENTITIES = {
   "&": "&amp;",
@@ -115,19 +116,22 @@ function createCountryCardHtml(viewModel) {
 }
 
 /**
- * Selects the first country with a flag URL, falling back to the first record.
+ * Selects the matching country by common name, falling back to the first record.
  * @param {Record<string, any>} responsePayload Parsed REST Countries v5 payload.
+ * @param {string} countryName Target country name to match.
  * @returns {Record<string, any> | null} Selected country object or null when absent.
  */
-function selectCountry(responsePayload) {
+function selectCountry(responsePayload, countryName) {
   const objects = responsePayload?.data?.objects;
   if (!Array.isArray(objects) || objects.length === 0) {
     return null;
   }
 
+  const normalizedTarget = countryName.toLowerCase();
   return (
-    objects.find((item) => item?.flag?.url_svg || item?.flag?.url_png) ??
-    objects[0]
+    objects.find(
+      (item) => item?.names?.common?.toLowerCase() === normalizedTarget,
+    ) ?? objects[0]
   );
 }
 
@@ -157,39 +161,65 @@ function renderCountryCard(country, container = countriesContainer) {
 }
 
 /**
- * Fetches JSON over XMLHttpRequest and passes the parsed payload to a callback.
+ * Fetches JSON over XMLHttpRequest and resolves with the parsed payload.
  * @param {string} url Request endpoint URL.
- * @param {(payload: any) => void} onSuccess Callback invoked with parsed JSON.
- * @returns {void} Nothing.
+ * @returns {Promise<any>} Resolves with parsed JSON or rejects on HTTP/network/parse errors.
  */
-function fetchJson(url, onSuccess) {
-  const request = new XMLHttpRequest();
-  request.open("GET", url);
+function fetchJson(url) {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open("GET", url);
 
-  request.addEventListener("load", function () {
-    if (!isSuccessStatus(this.status)) {
-      console.error(
-        `Request failed with status ${this.status}:`,
-        this.responseText,
-      );
-      return;
-    }
+    request.addEventListener("load", function () {
+      if (!isSuccessStatus(this.status)) {
+        reject(
+          new Error(`Request failed with status ${this.status}: ${this.responseText}`),
+        );
+        return;
+      }
 
-    try {
-      onSuccess(JSON.parse(this.responseText));
-    } catch (error) {
-      console.error("Failed to parse JSON response:", error);
-    }
+      try {
+        resolve(JSON.parse(this.responseText));
+      } catch (error) {
+        reject(new Error("Failed to parse JSON response.", { cause: error }));
+      }
+    });
+
+    request.addEventListener("error", () => {
+      reject(new Error("Network error occurred while making the request."));
+    });
+
+    request.send();
   });
-
-  request.addEventListener("error", function () {
-    console.error("Network error occurred while making the request.");
-  });
-
-  request.send();
 }
 
-fetchJson(COUNTRIES_API_URL, (payload) => {
-  console.log(payload);
-  renderCountryCard(selectCountry(payload));
-});
+/**
+ * Fetches and renders cards for the configured list of countries in order.
+ * @param {string[]} countryNames Country names to fetch and display.
+ * @param {Element | null} [container] Target DOM container.
+ * @returns {Promise<void>} Resolves after all country cards are processed.
+ */
+async function renderCountries(countryNames, container = countriesContainer) {
+  if (!container) {
+    return;
+  }
+
+  container.replaceChildren();
+
+  const requests = countryNames.map(async (countryName) => {
+    const url = `${COUNTRIES_API_URL}?q=${encodeURIComponent(countryName)}`;
+    const payload = await fetchJson(url);
+    return selectCountry(payload, countryName);
+  });
+
+  const results = await Promise.allSettled(requests);
+  results.forEach((result) => {
+    if (result.status === "fulfilled") {
+      renderCountryCard(result.value, container);
+    } else {
+      console.error(result.reason);
+    }
+  });
+}
+
+renderCountries(TARGET_COUNTRIES);
