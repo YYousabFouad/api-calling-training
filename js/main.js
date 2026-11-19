@@ -1,14 +1,44 @@
 "use strict";
 
-const btn = document.querySelector(".btn-country");
-const countriesContainer = document.querySelector(".countries");
+const btn =
+  typeof document !== "undefined"
+    ? document.querySelector(".btn-country")
+    : null;
+const countriesContainer =
+  typeof document !== "undefined"
+    ? document.querySelector(".countries")
+    : null;
 
 // NEW REVERSE GEOCODING API URL (use instead of the URL shown in videos):
 // https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lng}
 
 ///////////////////////////////////////
 
-const COUNTRIES_API_URL = "http://127.0.0.1:3000/api/countries";
+const DEFAULT_COUNTRIES_API_URL = "http://127.0.0.1:3000/api/countries";
+const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+const MAX_ERROR_BODY_LENGTH = 300;
+const VALID_ALPHA3_CODE = /^[A-Z]{3}$/;
+const LOCAL_PROXY_ORIGINS = new Set([
+  "http://127.0.0.1:3000",
+  "http://localhost:3000",
+]);
+
+/**
+ * Resolves the API proxy endpoint, preferring same-origin when served by server.js.
+ * @returns {string} The `/api/countries` endpoint URL.
+ */
+function resolveCountriesApiUrl() {
+  if (
+    typeof window !== "undefined" &&
+    LOCAL_PROXY_ORIGINS.has(window.location?.origin)
+  ) {
+    return `${window.location.origin}/api/countries`;
+  }
+
+  return DEFAULT_COUNTRIES_API_URL;
+}
+
+const COUNTRIES_API_URL = resolveCountriesApiUrl();
 const TARGET_COUNTRIES = ["portugal", "argentina"];
 const ONE_MILLION = 1_000_000;
 const HTML_ENTITIES = {
@@ -119,6 +149,16 @@ function createCountryCardHtml(viewModel, className = "") {
 }
 
 /**
+ * Extracts the first country record from a REST Countries v5 payload.
+ * @param {Record<string, any>} responsePayload Parsed REST Countries v5 payload.
+ * @returns {Record<string, any> | null} First country object or null when absent.
+ */
+function extractFirstCountry(responsePayload) {
+  const objects = responsePayload?.data?.objects;
+  return Array.isArray(objects) && objects.length > 0 ? objects[0] : null;
+}
+
+/**
  * Selects the matching country by common name, falling back to the first record.
  * @param {Record<string, any>} responsePayload Parsed REST Countries v5 payload.
  * @param {string} countryName Target country name to match.
@@ -130,7 +170,12 @@ function selectCountry(responsePayload, countryName) {
     return null;
   }
 
-  const normalizedTarget = countryName.toLowerCase();
+  const normalizedTarget =
+    typeof countryName === "string" ? countryName.trim().toLowerCase() : "";
+  if (!normalizedTarget) {
+    return objects[0];
+  }
+
   return (
     objects.find(
       (item) => item?.names?.common?.toLowerCase() === normalizedTarget,
@@ -145,16 +190,17 @@ function selectCountry(responsePayload, countryName) {
  */
 function getFirstNeighbourCode(country) {
   const borders = country?.borders;
-  return Array.isArray(borders) && borders.length > 0 ? borders[0] : null;
-}
+  if (!Array.isArray(borders) || borders.length === 0) {
+    return null;
+  }
 
-/**
- * Checks whether an HTTP status code indicates a successful 2xx response.
- * @param {number} status HTTP response status code.
- * @returns {boolean} True when status is in the 200-299 range.
- */
-function isSuccessStatus(status) {
-  return status >= 200 && status < 300;
+  const firstBorder = borders[0];
+  if (typeof firstBorder !== "string") {
+    return null;
+  }
+
+  const normalizedCode = firstBorder.trim().toUpperCase();
+  return normalizedCode || null;
 }
 
 /**
@@ -177,97 +223,359 @@ function renderCountryCard(
 }
 
 /**
- * Fetches JSON over XMLHttpRequest and resolves with the parsed payload.
- * @param {string} url Request endpoint URL.
- * @returns {Promise<any>} Resolves with parsed JSON or rejects on HTTP/network/parse errors.
+ * Represents a non-2xx HTTP response returned by an upstream fetch call.
  */
-function fetchJson(url) {
-  return new Promise((resolve, reject) => {
-    const request = new XMLHttpRequest();
-    request.open("GET", url);
+class HttpError extends Error {
+  /**
+   * @param {string} message Human-readable error summary.
+   * @param {{ status: number, statusText?: string, url?: string, body?: string }} details HTTP failure metadata.
+   */
+  constructor(message, { status, statusText = "", url = "", body = "" }) {
+    super(message);
+    this.name = "HttpError";
+    this.status = status;
+    this.statusText = statusText;
+    this.url = url;
+    this.body = body;
+  }
+}
 
-    request.addEventListener("load", function () {
-      if (!isSuccessStatus(this.status)) {
-        reject(
-          new Error(
-            `Request failed with status ${this.status}: ${this.responseText}`,
-          ),
-        );
-        return;
+/**
+ * Builds a countries proxy endpoint URL with validated query parameters.
+ * @param {Record<string, string>} params Query parameters to attach.
+ * @param {string} [baseUrl] Base `/api/countries` endpoint URL.
+ * @returns {string} Serialized request URL.
+ */
+function buildCountriesApiUrl(params, baseUrl = COUNTRIES_API_URL) {
+  const url = new URL(baseUrl);
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== "") {
+      url.searchParams.set(key, String(value));
+    }
+  });
+  return url.toString();
+}
+
+/**
+ * Creates a TimeoutError matching standard AbortSignal.timeout() semantics.
+ * @param {number} timeoutMs Timeout threshold in milliseconds.
+ * @returns {Error} Error instance with `name === "TimeoutError"`.
+ */
+function createTimeoutError(timeoutMs) {
+  const error = new Error(`Request timed out after ${timeoutMs}ms.`);
+  error.name = "TimeoutError";
+  return error;
+}
+
+/**
+ * Creates an AbortSignal combining an optional caller signal with a request timeout.
+ * @param {number} [timeoutMs] Timeout in milliseconds; non-positive or non-finite disables timeout.
+ * @param {AbortSignal} [externalSignal] Optional caller-provided abort signal.
+ * @returns {{ signal: AbortSignal, cleanup: () => void }} Combined signal and timer/listener cleanup callback.
+ */
+function createRequestSignal(
+  timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
+  externalSignal,
+) {
+  const controller = new AbortController();
+  let timeoutId = null;
+  let onExternalAbort = null;
+
+  const cleanup = () => {
+    if (timeoutId !== null) {
+      clearTimeout(timeoutId);
+      timeoutId = null;
+    }
+    if (externalSignal && onExternalAbort) {
+      externalSignal.removeEventListener("abort", onExternalAbort);
+      onExternalAbort = null;
+    }
+  };
+
+  const abortWithExternalReason = () => {
+    cleanup();
+    if (
+      externalSignal &&
+      "reason" in externalSignal &&
+      externalSignal.reason !== undefined
+    ) {
+      controller.abort(externalSignal.reason);
+      return;
+    }
+    controller.abort();
+  };
+
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      abortWithExternalReason();
+      return { signal: controller.signal, cleanup };
+    }
+    onExternalAbort = abortWithExternalReason;
+    externalSignal.addEventListener("abort", onExternalAbort, { once: true });
+  }
+
+  if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+    timeoutId = setTimeout(() => {
+      cleanup();
+      controller.abort(createTimeoutError(timeoutMs));
+    }, timeoutMs);
+  }
+
+  return { signal: controller.signal, cleanup };
+}
+
+/**
+ * Extracts a concise error detail string from an HTTP error response body.
+ * @param {Response} response Fetch Response object with non-2xx status.
+ * @returns {Promise<string>} Bounded error detail message or statusText fallback.
+ */
+function readErrorMessage(response) {
+  const fallback = response?.statusText || "";
+  if (typeof response?.text !== "function") {
+    return Promise.resolve(fallback);
+  }
+
+  return response
+    .text()
+    .then((rawText) => {
+      const trimmed = rawText.trim();
+      if (!trimmed) {
+        return fallback;
       }
 
+      let detail = "";
       try {
-        resolve(JSON.parse(this.responseText));
-      } catch (error) {
-        reject(new Error("Failed to parse JSON response.", { cause: error }));
+        const parsed = JSON.parse(trimmed);
+        if (typeof parsed?.error === "string") {
+          detail = parsed.error.trim();
+        } else if (typeof parsed?.message === "string") {
+          detail = parsed.message.trim();
+        }
+      } catch {
+        // Non-JSON error bodies fall through to bounded plain-text truncation.
       }
-    });
 
-    request.addEventListener("error", () => {
-      reject(new Error("Network error occurred while making the request."));
-    });
+      const messageText = detail || trimmed;
+      return messageText.length > MAX_ERROR_BODY_LENGTH
+        ? `${messageText.slice(0, MAX_ERROR_BODY_LENGTH - 3)}...`
+        : messageText;
+    })
+    .catch(() => fallback);
+}
 
-    request.send();
+/**
+ * Validates HTTP status and parses a Fetch Response body as JSON.
+ * @param {Response} response Fetch Response object.
+ * @param {{ url?: string, signal?: AbortSignal }} [options] Request context for error reporting.
+ * @returns {Promise<any>} Resolves with parsed JSON or rejects with HttpError, abort, or parse error.
+ */
+function parseJsonResponse(
+  response,
+  { url = response?.url || "", signal } = {},
+) {
+  if (!response?.ok) {
+    return readErrorMessage(response).then((detail) => {
+      if (signal?.aborted && signal.reason instanceof Error) {
+        throw signal.reason;
+      }
+      const suffix = detail ? `: ${detail}` : "";
+      throw new HttpError(
+        `Request failed with status ${response.status}${suffix}`,
+        {
+          status: response.status,
+          statusText: response.statusText || "",
+          url,
+          body: detail,
+        },
+      );
+    });
+  }
+
+  return response.json().catch((error) => {
+    if (signal?.aborted && signal.reason instanceof Error) {
+      throw signal.reason;
+    }
+    if (error?.name === "TimeoutError" || error?.name === "AbortError") {
+      throw error;
+    }
+    throw new Error("Failed to parse JSON response.", { cause: error });
   });
 }
 
 /**
- * Fetches a country and its first bordering neighbour country.
- * @param {string} countryName Country name to search.
- * @returns {Promise<{ country: Record<string, any> | null, neighbour: Record<string, any> | null }>} Country pair.
+ * Fetches JSON from a URL using the Fetch API with timeout and abort support.
+ * @param {string} url Request endpoint URL.
+ * @param {{ signal?: AbortSignal, timeoutMs?: number, headers?: Record<string, string>, fetcher?: typeof fetch }} [options] Request options.
+ * @returns {Promise<any>} Resolves with parsed JSON or rejects on HTTP, timeout, abort, network, or parse failure.
  */
-async function fetchCountryWithNeighbour(countryName) {
-  const searchUrl = `${COUNTRIES_API_URL}?q=${encodeURIComponent(countryName)}`;
-  const payload = await fetchJson(searchUrl);
-  const country = selectCountry(payload, countryName);
-  const neighbourCode = getFirstNeighbourCode(country);
+function fetchJson(url, options = {}) {
+  const {
+    signal: externalSignal,
+    timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
+    headers = {},
+    fetcher = globalThis.fetch,
+  } = options;
 
-  if (!neighbourCode) {
-    return { country, neighbour: null };
+  if (typeof fetcher !== "function") {
+    return Promise.reject(
+      new Error("Fetch API is not available in this environment."),
+    );
   }
 
-  try {
-    const neighbourUrl = `${COUNTRIES_API_URL}?code=${encodeURIComponent(neighbourCode)}`;
-    const neighbourPayload = await fetchJson(neighbourUrl);
-    return {
-      country,
-      neighbour: neighbourPayload?.data?.objects?.[0] ?? null,
-    };
-  } catch (error) {
-    console.error(`Failed to load neighbour ${neighbourCode}:`, error);
-    return { country, neighbour: null };
+  const { signal, cleanup } = createRequestSignal(timeoutMs, externalSignal);
+
+  return Promise.resolve()
+    .then(() =>
+      fetcher(url, {
+        method: "GET",
+        headers: { Accept: "application/json", ...headers },
+        signal,
+      }),
+    )
+    .catch((error) => {
+      if (signal.aborted && signal.reason instanceof Error) {
+        throw signal.reason;
+      }
+      if (error?.name === "TimeoutError" || error?.name === "AbortError") {
+        throw error;
+      }
+      throw new Error(`Network request failed for ${url}.`, { cause: error });
+    })
+    .then((response) => parseJsonResponse(response, { url, signal }))
+    .finally(cleanup);
+}
+
+/**
+ * Fetches a single country record by common name.
+ * @param {string} countryName Country name to search.
+ * @param {{ apiUrl?: string, signal?: AbortSignal, timeoutMs?: number, headers?: Record<string, string>, fetcher?: typeof fetch }} [options] Request options.
+ * @returns {Promise<Record<string, any>>} Resolves with the matched country object.
+ */
+function fetchCountryByName(countryName, options = {}) {
+  const normalizedName =
+    typeof countryName === "string" ? countryName.trim() : "";
+  if (!normalizedName) {
+    return Promise.reject(
+      new TypeError("Country name must be a non-empty string."),
+    );
   }
+
+  const { apiUrl = COUNTRIES_API_URL, ...requestOptions } = options;
+  const searchUrl = buildCountriesApiUrl({ q: normalizedName }, apiUrl);
+
+  return fetchJson(searchUrl, requestOptions).then((payload) => {
+    const country = selectCountry(payload, normalizedName);
+    if (!country) {
+      throw new Error(`No country data returned for "${normalizedName}".`);
+    }
+    return country;
+  });
+}
+
+/**
+ * Fetches a single country record by 3-letter ISO alpha-3 code.
+ * @param {string} countryCode Three-letter ISO alpha-3 country code.
+ * @param {{ apiUrl?: string, signal?: AbortSignal, timeoutMs?: number, headers?: Record<string, string>, fetcher?: typeof fetch }} [options] Request options.
+ * @returns {Promise<Record<string, any> | null>} Resolves with the matched country object or null when absent.
+ */
+function fetchCountryByCode(countryCode, options = {}) {
+  const normalizedCode =
+    typeof countryCode === "string" ? countryCode.trim().toUpperCase() : "";
+  if (!VALID_ALPHA3_CODE.test(normalizedCode)) {
+    return Promise.reject(
+      new TypeError(
+        `Invalid ISO alpha-3 country code "${String(countryCode)}".`,
+      ),
+    );
+  }
+
+  const { apiUrl = COUNTRIES_API_URL, ...requestOptions } = options;
+  const codeUrl = buildCountriesApiUrl({ code: normalizedCode }, apiUrl);
+
+  return fetchJson(codeUrl, requestOptions).then(extractFirstCountry);
+}
+
+/**
+ * Fetches a country and its first bordering neighbour country via chained Promises.
+ * @param {string} countryName Country name to search.
+ * @param {{ apiUrl?: string, signal?: AbortSignal, timeoutMs?: number, headers?: Record<string, string>, fetcher?: typeof fetch }} [options] Request options.
+ * @returns {Promise<{ country: Record<string, any>, neighbour: Record<string, any> | null }>} Country pair.
+ */
+function fetchCountryWithNeighbour(countryName, options = {}) {
+  return fetchCountryByName(countryName, options).then((country) => {
+    const neighbourCode = getFirstNeighbourCode(country);
+    if (!neighbourCode) {
+      return { country, neighbour: null };
+    }
+
+    return fetchCountryByCode(neighbourCode, options)
+      .then((neighbour) => ({ country, neighbour }))
+      .catch((error) => {
+        if (options.signal?.aborted) {
+          throw error;
+        }
+        console.error(`Failed to load neighbour ${neighbourCode}:`, error);
+        return { country, neighbour: null };
+      });
+  });
 }
 
 /**
  * Fetches and renders cards for each configured country and its neighbour in order.
  * @param {string[]} countryNames Country names to fetch and display.
  * @param {Element | null} [container] Target DOM container.
+ * @param {{ apiUrl?: string, signal?: AbortSignal, timeoutMs?: number, headers?: Record<string, string>, fetcher?: typeof fetch }} [options] Request options.
  * @returns {Promise<void>} Resolves after all country cards are processed.
  */
-async function renderCountries(countryNames, container = countriesContainer) {
+function renderCountries(
+  countryNames,
+  container = countriesContainer,
+  options = {},
+) {
   if (!container) {
-    return;
+    return Promise.resolve();
   }
 
   container.replaceChildren();
 
-  const results = await Promise.allSettled(
-    countryNames.map((countryName) => fetchCountryWithNeighbour(countryName)),
-  );
+  return Promise.allSettled(
+    countryNames.map((countryName) =>
+      fetchCountryWithNeighbour(countryName, options),
+    ),
+  ).then((results) => {
+    results.forEach((result) => {
+      if (result.status !== "fulfilled") {
+        console.error(result.reason);
+        return;
+      }
 
-  results.forEach((result) => {
-    if (result.status !== "fulfilled") {
-      console.error(result.reason);
-      return;
-    }
-
-    const { country, neighbour } = result.value;
-    renderCountryCard(country, { container });
-    if (neighbour) {
-      renderCountryCard(neighbour, { className: "neighbour", container });
-    }
+      const { country, neighbour } = result.value;
+      renderCountryCard(country, { container });
+      if (neighbour) {
+        renderCountryCard(neighbour, { className: "neighbour", container });
+      }
+    });
   });
 }
 
-renderCountries(TARGET_COUNTRIES);
+if (typeof document !== "undefined") {
+  renderCountries(TARGET_COUNTRIES).catch((error) => {
+    console.error("Failed to render countries:", error);
+  });
+}
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    HttpError,
+    buildCountriesApiUrl,
+    createRequestSignal,
+    extractFirstCountry,
+    fetchJson,
+    fetchCountryByName,
+    fetchCountryByCode,
+    fetchCountryWithNeighbour,
+    getFirstNeighbourCode,
+    renderCountries,
+    selectCountry,
+  };
+}

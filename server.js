@@ -10,7 +10,7 @@ const MAX_QUERY_LENGTH = 100;
 const VALID_ALPHA3_CODE = /^[A-Z]{3}$/;
 const MAX_UPSTREAM_BYTES = 10_485_760;
 const REQUEST_TIMEOUT_MS = 20_000;
-const SERVER_REQUEST_TIMEOUT_MS = 15_000;
+const SERVER_REQUEST_TIMEOUT_MS = 25_000;
 const SERVER_HEADERS_TIMEOUT_MS = 10_000;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 const RATE_LIMIT_MAX_REQUESTS = 30;
@@ -194,18 +194,22 @@ async function readBoundedResponseText(upstreamResponse, maxBytes) {
   const chunks = [];
   let totalBytes = 0;
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) {
-      break;
-    }
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
 
-    totalBytes += value.byteLength;
-    if (totalBytes > maxBytes) {
-      await reader.cancel();
-      throw new Error("Upstream response exceeded maximum allowed size.");
+      totalBytes += value.byteLength;
+      if (totalBytes > maxBytes) {
+        await reader.cancel();
+        throw new Error("Upstream response exceeded maximum allowed size.");
+      }
+      chunks.push(value);
     }
-    chunks.push(value);
+  } finally {
+    reader.releaseLock();
   }
 
   return Buffer.concat(chunks, totalBytes).toString("utf8");
@@ -320,6 +324,7 @@ async function handleCountrySearch(request, response, requestUrl) {
 
     const contentType = upstreamResponse.headers.get("content-type") || "";
     if (!contentType.toLowerCase().includes("application/json")) {
+      await upstreamResponse.body?.cancel();
       return sendJson(
         response,
         502,
@@ -336,10 +341,15 @@ async function handleCountrySearch(request, response, requestUrl) {
     sendJson(response, upstreamResponse.status, parsedBody, corsHeaders);
   } catch (error) {
     console.error("Country API request failed:", error);
+    const isTimeout = error?.name === "TimeoutError";
     sendJson(
       response,
-      502,
-      { error: "Country API request failed" },
+      isTimeout ? 504 : 502,
+      {
+        error: isTimeout
+          ? "Country API request timed out"
+          : "Country API request failed",
+      },
       corsHeaders,
     );
   }
