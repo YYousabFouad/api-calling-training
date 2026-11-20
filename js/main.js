@@ -325,42 +325,57 @@ function createRequestSignal(
 }
 
 /**
+ * Rethrows an abort or timeout error instead of wrapping it as a network or parse failure.
+ * @param {AbortSignal | undefined} signal Active request abort signal.
+ * @param {unknown} [error] Caught error, if any.
+ * @returns {void} Nothing.
+ */
+function rethrowIfAborted(signal, error) {
+  if (signal?.aborted && signal.reason instanceof Error) {
+    throw signal.reason;
+  }
+  if (error?.name === "TimeoutError" || error?.name === "AbortError") {
+    throw error;
+  }
+}
+
+/**
  * Extracts a concise error detail string from an HTTP error response body.
  * @param {Response} response Fetch Response object with non-2xx status.
  * @returns {Promise<string>} Bounded error detail message or statusText fallback.
  */
-function readErrorMessage(response) {
+async function readErrorMessage(response) {
   const fallback = response?.statusText || "";
   if (typeof response?.text !== "function") {
-    return Promise.resolve(fallback);
+    return fallback;
   }
 
-  return response
-    .text()
-    .then((rawText) => {
-      const trimmed = rawText.trim();
-      if (!trimmed) {
-        return fallback;
-      }
+  try {
+    const rawText = await response.text();
+    const trimmed = rawText.trim();
+    if (!trimmed) {
+      return fallback;
+    }
 
-      let detail = "";
-      try {
-        const parsed = JSON.parse(trimmed);
-        if (typeof parsed?.error === "string") {
-          detail = parsed.error.trim();
-        } else if (typeof parsed?.message === "string") {
-          detail = parsed.message.trim();
-        }
-      } catch {
-        // Non-JSON error bodies fall through to bounded plain-text truncation.
+    let detail = "";
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (typeof parsed?.error === "string") {
+        detail = parsed.error.trim();
+      } else if (typeof parsed?.message === "string") {
+        detail = parsed.message.trim();
       }
+    } catch {
+      // Non-JSON error bodies fall through to bounded plain-text truncation.
+    }
 
-      const messageText = detail || trimmed;
-      return messageText.length > MAX_ERROR_BODY_LENGTH
-        ? `${messageText.slice(0, MAX_ERROR_BODY_LENGTH - 3)}...`
-        : messageText;
-    })
-    .catch(() => fallback);
+    const messageText = detail || trimmed;
+    return messageText.length > MAX_ERROR_BODY_LENGTH
+      ? `${messageText.slice(0, MAX_ERROR_BODY_LENGTH - 3)}...`
+      : messageText;
+  } catch {
+    return fallback;
+  }
 }
 
 /**
@@ -369,46 +384,40 @@ function readErrorMessage(response) {
  * @param {{ url?: string, signal?: AbortSignal }} [options] Request context for error reporting.
  * @returns {Promise<any>} Resolves with parsed JSON or rejects with HttpError, abort, or parse error.
  */
-function parseJsonResponse(
+async function parseJsonResponse(
   response,
   { url = response?.url || "", signal } = {},
 ) {
   if (!response?.ok) {
-    return readErrorMessage(response).then((detail) => {
-      if (signal?.aborted && signal.reason instanceof Error) {
-        throw signal.reason;
-      }
-      const suffix = detail ? `: ${detail}` : "";
-      throw new HttpError(
-        `Request failed with status ${response.status}${suffix}`,
-        {
-          status: response.status,
-          statusText: response.statusText || "",
-          url,
-          body: detail,
-        },
-      );
-    });
+    const detail = await readErrorMessage(response);
+    rethrowIfAborted(signal);
+    const suffix = detail ? `: ${detail}` : "";
+    throw new HttpError(
+      `Request failed with status ${response.status}${suffix}`,
+      {
+        status: response.status,
+        statusText: response.statusText || "",
+        url,
+        body: detail,
+      },
+    );
   }
 
-  return response.json().catch((error) => {
-    if (signal?.aborted && signal.reason instanceof Error) {
-      throw signal.reason;
-    }
-    if (error?.name === "TimeoutError" || error?.name === "AbortError") {
-      throw error;
-    }
+  try {
+    return await response.json();
+  } catch (error) {
+    rethrowIfAborted(signal, error);
     throw new Error("Failed to parse JSON response.", { cause: error });
-  });
+  }
 }
 
 /**
- * Fetches JSON from a URL using the Fetch API with timeout and abort support.
+ * Fetches JSON from a URL using the Fetch API with async/await, timeout, and abort support.
  * @param {string} url Request endpoint URL.
  * @param {{ signal?: AbortSignal, timeoutMs?: number, headers?: Record<string, string>, fetcher?: typeof fetch }} [options] Request options.
  * @returns {Promise<any>} Resolves with parsed JSON or rejects on HTTP, timeout, abort, network, or parse failure.
  */
-function fetchJson(url, options = {}) {
+async function fetchJson(url, options = {}) {
   const {
     signal: externalSignal,
     timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
@@ -417,32 +426,28 @@ function fetchJson(url, options = {}) {
   } = options;
 
   if (typeof fetcher !== "function") {
-    return Promise.reject(
-      new Error("Fetch API is not available in this environment."),
-    );
+    throw new Error("Fetch API is not available in this environment.");
   }
 
   const { signal, cleanup } = createRequestSignal(timeoutMs, externalSignal);
 
-  return Promise.resolve()
-    .then(() =>
-      fetcher(url, {
+  try {
+    let response;
+    try {
+      response = await fetcher(url, {
         method: "GET",
         headers: { Accept: "application/json", ...headers },
         signal,
-      }),
-    )
-    .catch((error) => {
-      if (signal.aborted && signal.reason instanceof Error) {
-        throw signal.reason;
-      }
-      if (error?.name === "TimeoutError" || error?.name === "AbortError") {
-        throw error;
-      }
+      });
+    } catch (error) {
+      rethrowIfAborted(signal, error);
       throw new Error(`Network request failed for ${url}.`, { cause: error });
-    })
-    .then((response) => parseJsonResponse(response, { url, signal }))
-    .finally(cleanup);
+    }
+
+    return await parseJsonResponse(response, { url, signal });
+  } finally {
+    cleanup();
+  }
 }
 
 /**
@@ -451,25 +456,22 @@ function fetchJson(url, options = {}) {
  * @param {{ apiUrl?: string, signal?: AbortSignal, timeoutMs?: number, headers?: Record<string, string>, fetcher?: typeof fetch }} [options] Request options.
  * @returns {Promise<Record<string, any>>} Resolves with the matched country object.
  */
-function fetchCountryByName(countryName, options = {}) {
+async function fetchCountryByName(countryName, options = {}) {
   const normalizedName =
     typeof countryName === "string" ? countryName.trim() : "";
   if (!normalizedName) {
-    return Promise.reject(
-      new TypeError("Country name must be a non-empty string."),
-    );
+    throw new TypeError("Country name must be a non-empty string.");
   }
 
   const { apiUrl = COUNTRIES_API_URL, ...requestOptions } = options;
   const searchUrl = buildCountriesApiUrl({ q: normalizedName }, apiUrl);
 
-  return fetchJson(searchUrl, requestOptions).then((payload) => {
-    const country = selectCountry(payload, normalizedName);
-    if (!country) {
-      throw new Error(`No country data returned for "${normalizedName}".`);
-    }
-    return country;
-  });
+  const payload = await fetchJson(searchUrl, requestOptions);
+  const country = selectCountry(payload, normalizedName);
+  if (!country) {
+    throw new Error(`No country data returned for "${normalizedName}".`);
+  }
+  return country;
 }
 
 /**
@@ -478,46 +480,45 @@ function fetchCountryByName(countryName, options = {}) {
  * @param {{ apiUrl?: string, signal?: AbortSignal, timeoutMs?: number, headers?: Record<string, string>, fetcher?: typeof fetch }} [options] Request options.
  * @returns {Promise<Record<string, any> | null>} Resolves with the matched country object or null when absent.
  */
-function fetchCountryByCode(countryCode, options = {}) {
+async function fetchCountryByCode(countryCode, options = {}) {
   const normalizedCode =
     typeof countryCode === "string" ? countryCode.trim().toUpperCase() : "";
   if (!VALID_ALPHA3_CODE.test(normalizedCode)) {
-    return Promise.reject(
-      new TypeError(
-        `Invalid ISO alpha-3 country code "${String(countryCode)}".`,
-      ),
+    throw new TypeError(
+      `Invalid ISO alpha-3 country code "${String(countryCode)}".`,
     );
   }
 
   const { apiUrl = COUNTRIES_API_URL, ...requestOptions } = options;
   const codeUrl = buildCountriesApiUrl({ code: normalizedCode }, apiUrl);
 
-  return fetchJson(codeUrl, requestOptions).then(extractFirstCountry);
+  const payload = await fetchJson(codeUrl, requestOptions);
+  return extractFirstCountry(payload);
 }
 
 /**
- * Fetches a country and its first bordering neighbour country via chained Promises.
+ * Fetches a country and its first bordering neighbour country using async/await.
  * @param {string} countryName Country name to search.
  * @param {{ apiUrl?: string, signal?: AbortSignal, timeoutMs?: number, headers?: Record<string, string>, fetcher?: typeof fetch }} [options] Request options.
  * @returns {Promise<{ country: Record<string, any>, neighbour: Record<string, any> | null }>} Country pair.
  */
-function fetchCountryWithNeighbour(countryName, options = {}) {
-  return fetchCountryByName(countryName, options).then((country) => {
-    const neighbourCode = getFirstNeighbourCode(country);
-    if (!neighbourCode) {
-      return { country, neighbour: null };
-    }
+async function fetchCountryWithNeighbour(countryName, options = {}) {
+  const country = await fetchCountryByName(countryName, options);
+  const neighbourCode = getFirstNeighbourCode(country);
+  if (!neighbourCode) {
+    return { country, neighbour: null };
+  }
 
-    return fetchCountryByCode(neighbourCode, options)
-      .then((neighbour) => ({ country, neighbour }))
-      .catch((error) => {
-        if (options.signal?.aborted) {
-          throw error;
-        }
-        console.error(`Failed to load neighbour ${neighbourCode}:`, error);
-        return { country, neighbour: null };
-      });
-  });
+  try {
+    const neighbour = await fetchCountryByCode(neighbourCode, options);
+    return { country, neighbour };
+  } catch (error) {
+    if (options.signal?.aborted) {
+      throw error;
+    }
+    console.error(`Failed to load neighbour ${neighbourCode}:`, error);
+    return { country, neighbour: null };
+  }
 }
 
 /**
@@ -527,41 +528,51 @@ function fetchCountryWithNeighbour(countryName, options = {}) {
  * @param {{ apiUrl?: string, signal?: AbortSignal, timeoutMs?: number, headers?: Record<string, string>, fetcher?: typeof fetch }} [options] Request options.
  * @returns {Promise<void>} Resolves after all country cards are processed.
  */
-function renderCountries(
+async function renderCountries(
   countryNames,
   container = countriesContainer,
   options = {},
 ) {
   if (!container) {
-    return Promise.resolve();
+    return;
   }
 
   container.replaceChildren();
 
-  return Promise.allSettled(
+  const results = await Promise.allSettled(
     countryNames.map((countryName) =>
       fetchCountryWithNeighbour(countryName, options),
     ),
-  ).then((results) => {
-    results.forEach((result) => {
-      if (result.status !== "fulfilled") {
-        console.error(result.reason);
-        return;
-      }
+  );
 
-      const { country, neighbour } = result.value;
-      renderCountryCard(country, { container });
-      if (neighbour) {
-        renderCountryCard(neighbour, { className: "neighbour", container });
-      }
-    });
-  });
+  for (const result of results) {
+    if (result.status !== "fulfilled") {
+      console.error(result.reason);
+      continue;
+    }
+
+    const { country, neighbour } = result.value;
+    renderCountryCard(country, { container });
+    if (neighbour) {
+      renderCountryCard(neighbour, { className: "neighbour", container });
+    }
+  }
+}
+
+/**
+ * Initializes country rendering in the browser with top-level error handling.
+ * @returns {Promise<void>} Resolves once initial rendering finishes or logs any failure.
+ */
+async function init() {
+  try {
+    await renderCountries(TARGET_COUNTRIES);
+  } catch (error) {
+    console.error("Failed to render countries:", error);
+  }
 }
 
 if (typeof document !== "undefined") {
-  renderCountries(TARGET_COUNTRIES).catch((error) => {
-    console.error("Failed to render countries:", error);
-  });
+  init();
 }
 
 if (typeof module !== "undefined" && module.exports) {
