@@ -359,55 +359,60 @@ async function handleCountrySearch(request, response, requestUrl) {
  * Routes a request to the country proxy or an explicitly allowed project file.
  * @param {import("node:http").IncomingMessage} request The incoming request.
  * @param {import("node:http").ServerResponse} response The outgoing response.
- * @returns {Promise<void>} Resolves after the response is sent.
- * @throws {Error} If file or response handling fails.
+ * @returns {Promise<void>} Resolves after the response is sent or an error response is written.
  */
 async function handleRequest(request, response) {
-  const requestUrl = parseRequestUrl(request.url || "/");
-  if (!requestUrl) {
-    return sendJson(response, 400, { error: "Invalid request URL" });
-  }
+  try {
+    const requestUrl = parseRequestUrl(request.url || "/");
+    if (!requestUrl) {
+      return sendJson(response, 400, { error: "Invalid request URL" });
+    }
 
-  if (requestUrl.pathname === "/api/countries") {
-    return handleCountrySearch(request, response, requestUrl);
-  }
+    if (requestUrl.pathname === "/api/countries") {
+      return await handleCountrySearch(request, response, requestUrl);
+    }
 
-  if (request.method !== "GET") {
-    return sendJson(
-      response,
-      405,
-      { error: "Method not allowed" },
-      { Allow: "GET" },
-    );
-  }
+    if (request.method !== "GET") {
+      return sendJson(
+        response,
+        405,
+        { error: "Method not allowed" },
+        { Allow: "GET" },
+      );
+    }
 
-  const staticFile = STATIC_FILES.get(requestUrl.pathname);
-  if (!staticFile) {
-    return sendJson(response, 404, { error: "Not found" });
-  }
+    const staticFile = STATIC_FILES.get(requestUrl.pathname);
+    if (!staticFile) {
+      return sendJson(response, 404, { error: "Not found" });
+    }
 
-  const body = await readFile(resolve(PROJECT_ROOT, staticFile.file));
-  const headers = {
-    ...BASE_SECURITY_HEADERS,
-    "Content-Type": staticFile.contentType,
-  };
-  if (staticFile.isHtml) {
-    headers["Content-Security-Policy"] = HTML_CSP;
-  }
+    const body = await readFile(resolve(PROJECT_ROOT, staticFile.file));
+    const headers = {
+      ...BASE_SECURITY_HEADERS,
+      "Content-Type": staticFile.contentType,
+    };
+    if (staticFile.isHtml) {
+      headers["Content-Security-Policy"] = HTML_CSP;
+    }
 
-  response.writeHead(200, headers);
-  response.end(body);
-}
-
-const server = createServer((request, response) => {
-  handleRequest(request, response).catch((error) => {
+    response.writeHead(200, headers);
+    response.end(body);
+  } catch (error) {
     console.error("Request handling failed:", error);
-    if (!response.headersSent) {
-      sendJson(response, 500, { error: "Internal server error" });
+    if (!response.headersSent && !response.writableEnded) {
+      try {
+        sendJson(response, 500, { error: "Internal server error" });
+      } catch {
+        response.destroy();
+      }
     } else {
       response.destroy();
     }
-  });
+  }
+}
+
+const server = createServer((request, response) => {
+  void handleRequest(request, response);
 });
 
 server.requestTimeout = SERVER_REQUEST_TIMEOUT_MS;
